@@ -9,7 +9,7 @@ import tempfile
 import urllib.parse
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -41,11 +41,26 @@ FIELD_TYPE_MAPPINGS = {
 }
 APPLE_CSV_HEADER = ["Title", "URL", "Username", "Password", "Notes", "OTPAuth"]
 GOOGLE_CSV_HEADER = ["url", "username", "password", "note"]
+BITWARDEN_CSV_HEADER = [
+    "folder",
+    "favorite",
+    "type",
+    "name",
+    "notes",
+    "fields",
+    "reprompt",
+    "login_uri",
+    "login_username",
+    "login_password",
+    "login_totp",
+]
 GOOGLE_IMPORT_LIMIT = 3_000
+BITWARDEN_IMPORT_LIMIT = 40_000
 
 
 class Target(StrEnum):
     APPLE = "apple"
+    BITWARDEN = "bitwarden"
     GOOGLE = "google"
 
 
@@ -64,6 +79,9 @@ class Entry:
     notes: str = ""
     totp: str = ""
     extra_notes: tuple[str, ...] = ()
+    category: str = ""
+    favorite: bool = False
+    folders: tuple[str, ...] = ()
     attachment_count: int = 0
     updated_at: int | None = None
     uuid: str = ""
@@ -129,6 +147,9 @@ def _entry_from_fields(
     title: str,
     notes: str,
     fields: Iterable[Mapping[str, object]],
+    category: str = "",
+    favorite: bool = False,
+    folders: tuple[str, ...] = (),
     attachment_count: int = 0,
     updated_at: int | None = None,
     uuid: str = "",
@@ -160,6 +181,9 @@ def _entry_from_fields(
         notes=notes,
         totp=values.get("TOTP", ""),
         extra_notes=tuple(extra_notes),
+        category=category,
+        favorite=favorite,
+        folders=folders,
         attachment_count=attachment_count,
         updated_at=updated_at,
         uuid=uuid,
@@ -178,6 +202,17 @@ def parse_enpass_json(
     if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
         raise ValueError("Invalid Enpass JSON export")
 
+    raw_folders = data.get("folders", [])
+    if not isinstance(raw_folders, list) or not all(
+        isinstance(folder, dict) for folder in raw_folders
+    ):
+        raise ValueError("Invalid folders in Enpass JSON export")
+    folder_names = {
+        str(folder.get("uuid")): str(folder.get("title", "")).strip()
+        for folder in raw_folders
+        if folder.get("uuid")
+    }
+
     entries: list[Entry] = []
     for item in data.get("items", []):
         if not isinstance(item, dict):
@@ -194,12 +229,22 @@ def parse_enpass_json(
         attachments = item.get("attachments", [])
         if not isinstance(attachments, list):
             raise ValueError("Invalid attachments in Enpass JSON export")
+        folder_ids = item.get("folders") or []
+        if not isinstance(folder_ids, list) or not all(
+            isinstance(folder_id, str) for folder_id in folder_ids
+        ):
+            raise ValueError("Invalid item folders in Enpass JSON export")
         timestamp = item.get("updated_at")
         entries.append(
             _entry_from_fields(
                 title=str(item.get("title", "")),
                 notes=str(item.get("note", "")),
                 fields=fields,
+                category=str(item.get("category", "")),
+                favorite=bool(item.get("favorite")),
+                folders=tuple(
+                    folder_names.get(folder_id) or folder_id for folder_id in folder_ids
+                ),
                 attachment_count=len(attachments),
                 updated_at=timestamp
                 if isinstance(timestamp, int) and not isinstance(timestamp, bool)
@@ -310,6 +355,9 @@ def _content_key(entry: Entry) -> tuple[object, ...]:
         entry.notes,
         entry.totp,
         entry.extra_notes,
+        entry.category,
+        entry.favorite,
+        entry.folders,
         entry.attachment_count,
     )
 
@@ -474,14 +522,18 @@ def _google_note(entry: Entry) -> str:
     )
 
 
-def write_google_csv(
-    entries: Sequence[Entry], output_filepath: str | Path, *, force: bool = False
+def _write_chunked_csv(
+    entries: Sequence[Entry],
+    output_filepath: str | Path,
+    header: Sequence[str],
+    row_factory: Callable[[Entry], Sequence[str]],
+    limit: int,
+    *,
+    force: bool = False,
 ) -> tuple[Path, ...]:
-    """Write Google Password Manager CSV files, splitting at its import limit."""
     output = Path(output_filepath)
     chunks = [
-        entries[index : index + GOOGLE_IMPORT_LIMIT]
-        for index in range(0, len(entries), GOOGLE_IMPORT_LIMIT)
+        entries[index : index + limit] for index in range(0, len(entries), limit)
     ] or [[]]
     if len(chunks) == 1:
         paths = [output]
@@ -501,14 +553,96 @@ def write_google_csv(
     for path, chunk in zip(paths, chunks, strict=True):
         _write_csv(
             path,
-            GOOGLE_CSV_HEADER,
-            (
-                (entry.url, entry.username, entry.password, _google_note(entry))
-                for entry in chunk
-            ),
+            header,
+            (row_factory(entry) for entry in chunk),
             force=force,
         )
     return tuple(paths)
+
+
+def write_google_csv(
+    entries: Sequence[Entry], output_filepath: str | Path, *, force: bool = False
+) -> tuple[Path, ...]:
+    """Write Google Password Manager CSV files, splitting at its import limit."""
+    return _write_chunked_csv(
+        entries,
+        output_filepath,
+        GOOGLE_CSV_HEADER,
+        lambda entry: (
+            entry.url,
+            entry.username,
+            entry.password,
+            _google_note(entry),
+        ),
+        GOOGLE_IMPORT_LIMIT,
+        force=force,
+    )
+
+
+def _bitwarden_type(entry: Entry) -> str:
+    if entry.category.casefold() in {"login", "password"}:
+        return "login"
+    if not entry.category and any(
+        (entry.url, entry.username, entry.password, entry.totp)
+    ):
+        return "login"
+    return "note"
+
+
+def _bitwarden_row(entry: Entry) -> tuple[str, ...]:
+    item_type = _bitwarden_type(entry)
+    multiple_folders = (
+        f"Enpass folders: {', '.join(entry.folders)}" if len(entry.folders) > 1 else ""
+    )
+    if item_type == "login":
+        notes = entry.notes
+        fields = "\n".join(
+            part for part in (*entry.extra_notes, multiple_folders) if part
+        )
+        login = (entry.url, entry.username, entry.password, entry.totp)
+    else:
+        credentials = (
+            f"URL: {entry.url}" if entry.url else "",
+            f"Username: {entry.username}" if entry.username else "",
+            f"Password: {entry.password}" if entry.password else "",
+            f"TOTP: {entry.totp}" if entry.totp else "",
+        )
+        notes = "\n".join(
+            part
+            for part in (
+                entry.notes,
+                *credentials,
+                *entry.extra_notes,
+                multiple_folders,
+            )
+            if part
+        )
+        fields = ""
+        login = ("", "", "", "")
+    return (
+        entry.folders[0] if len(entry.folders) == 1 else "",
+        "1" if entry.favorite else "",
+        item_type,
+        entry.title or "Untitled",
+        notes,
+        fields,
+        "0",
+        *login,
+    )
+
+
+def write_bitwarden_csv(
+    entries: Sequence[Entry], output_filepath: str | Path, *, force: bool = False
+) -> tuple[Path, ...]:
+    """Write personal-vault Bitwarden CSV files."""
+    return _write_chunked_csv(
+        entries,
+        output_filepath,
+        BITWARDEN_CSV_HEADER,
+        _bitwarden_row,
+        BITWARDEN_IMPORT_LIMIT,
+        force=force,
+    )
 
 
 def write_apple_csv_from_dicts(
@@ -587,7 +721,7 @@ def main(
         False, "--force", help="Replace an existing output file."
     ),
 ) -> None:
-    """Convert an Enpass export to Apple or Google Password Manager CSV."""
+    """Convert an Enpass export to Apple, Bitwarden, or Google CSV."""
     try:
         entries = parse_enpass(
             enpass_input_file,
@@ -616,6 +750,14 @@ def main(
         typer.echo(
             f"Not migrated: TOTP: {skipped_totp} | Attachments: {skipped_attachments}"
         )
+        if target == Target.BITWARDEN:
+            secure_notes = sum(
+                _bitwarden_type(entry) == "note" for entry in export_entries
+            )
+            typer.echo(
+                f"Bitwarden items: Logins: {len(export_entries) - secure_notes} | "
+                f"Secure notes: {secure_notes}"
+            )
         if dry_run:
             typer.echo("Dry run: no files created.")
             return
@@ -623,6 +765,8 @@ def main(
         destination = output_file or f"export-{target.value}-passwords.csv"
         if target == Target.GOOGLE:
             paths = write_google_csv(export_entries, destination, force=force)
+        elif target == Target.BITWARDEN:
+            paths = write_bitwarden_csv(export_entries, destination, force=force)
         else:
             write_apple_csv(export_entries, destination, force=force)
             paths = (Path(destination),)
