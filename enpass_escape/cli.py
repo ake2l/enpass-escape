@@ -1,383 +1,640 @@
+from __future__ import annotations
+
 import csv
-import re
-import urllib.parse
-import json
-from typing import List, Dict, Set
-import typer
 import itertools
+import json
+import os
+import re
+import tempfile
+import urllib.parse
+import warnings
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
 
-# --- Configuration for Enpass Field Mapping ---
-# Add known Enpass column names (case-insensitive) that map to Apple fields.
-# The script will try these in order. First one found will be used.
-ENPASS_FIELD_MAPPINGS: Dict[str, List[str]] = {
-    'Title': ['Title', 'Name', 'Login name', 'ItemName'],
-    'URL': ['URL', 'Website', 'Web Address', 'Login URL'],
-    'Username': ['Username', 'User ID', 'Login ID', 'Login Username'],
-    'Password': ['Password', '*Password', 'Passphrase', 'Login Password'],
-    'TOTP': ['TOTP', 'TOTP Secret', 'One-Time Password', 'OTP Secret', 'OTP', 'TOTP Key'],
-    'Notes': ['Note', 'Notes', 'Description', 'Details', 'Memo'] # Primary notes field from Enpass
+import typer
+
+
+ENPASS_FIELD_MAPPINGS: dict[str, tuple[str, ...]] = {
+    "Title": ("Title", "Name", "Login name", "ItemName"),
+    "URL": ("URL", "Website", "Web Address", "Login URL"),
+    "Username": ("Username", "User ID", "Login ID", "Login Username"),
+    "Password": ("Password", "*Password", "Passphrase", "Login Password"),
+    "TOTP": (
+        "TOTP",
+        "TOTP Secret",
+        "One-Time Password",
+        "One-time code",
+        "OTP Secret",
+        "OTP",
+        "TOTP Key",
+    ),
+    "Notes": ("Note", "Notes", "Description", "Details", "Memo", "My notes"),
 }
+FIELD_TYPE_MAPPINGS = {
+    "url": "URL",
+    "username": "Username",
+    "password": "Password",
+    "totp": "TOTP",
+}
+APPLE_CSV_HEADER = ["Title", "URL", "Username", "Password", "Notes", "OTPAuth"]
+GOOGLE_CSV_HEADER = ["url", "username", "password", "note"]
+GOOGLE_IMPORT_LIMIT = 3_000
 
-# Apple Passwords CSV Header
-APPLE_CSV_HEADER: List[str] = ['Title', 'URL', 'Username', 'Password', 'Notes', 'OTPAuth']
+
+class Target(StrEnum):
+    APPLE = "apple"
+    GOOGLE = "google"
+
+
+class DuplicatePolicy(StrEnum):
+    KEEP = "keep"
+    EXACT = "exact"
+    NEWEST = "newest"
+
+
+@dataclass(frozen=True, slots=True)
+class Entry:
+    title: str = ""
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    notes: str = ""
+    totp: str = ""
+    extra_notes: tuple[str, ...] = ()
+    attachment_count: int = 0
+    updated_at: int | None = None
+    uuid: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DeduplicationResult:
+    entries: tuple[Entry, ...]
+    removed: int = 0
+    conflicts: int = 0
+
+
+def _mapped_field(label: str, field_type: str = "") -> str | None:
+    if mapped := FIELD_TYPE_MAPPINGS.get(field_type.casefold()):
+        return mapped
+    folded_label = label.casefold()
+    return next(
+        (
+            name
+            for name, options in ENPASS_FIELD_MAPPINGS.items()
+            if folded_label in (option.casefold() for option in options)
+        ),
+        None,
+    )
+
 
 def generate_otpauth_url(secret_key: str, title: str = "", username: str = "") -> str:
-    """Generates an otpauth://totp URL for use with authenticator apps.
-
-    Args:
-        secret_key: The Base32 encoded TOTP secret key.
-        title: The title of the account or service (can be used as issuer).
-        username: The username or account identifier.
-
-    Returns:
-        A string representing the otpauth://totp URL, or an empty string
-        if the secret_key is empty.
-    """
+    """Return an otpauth URI for an Enpass TOTP secret."""
     if not secret_key:
         return ""
+    if secret_key.casefold().startswith("otpauth://"):
+        return secret_key
 
     cleaned_secret = secret_key.replace(" ", "").upper()
-    # Basic check for Base32 characters. A more robust validation might be needed
-    # if secrets can come in various non-standard formats.
     if not re.fullmatch(r"[A-Z2-7=]+", cleaned_secret):
-        print(f"Warning: TOTP secret for '{title if title else username}' "
-              f"('{secret_key[:10]}...') contains potentially invalid characters. "
-              f"OTPAuth URL might be invalid.")
-        # Depending on strictness, one might return "" or proceed.
-        # Let's proceed but with the potentially problematic secret.
+        warnings.warn(
+            f"TOTP secret for '{title or username}' contains invalid Base32 characters",
+            stacklevel=2,
+        )
 
-    # Construct the label for the OTPAuth URL.
-    # Apple Passwords often uses Title for issuer and Username for account.
-    # Format: Issuer:AccountName or just AccountName
-    issuer_name = title.strip()
-    account_name = username.strip()
-
-    if issuer_name and account_name:
-        label = f"{issuer_name}:{account_name}"
-    elif account_name:
-        label = account_name
-    elif issuer_name: # Less common to have issuer without account, but possible
-        label = issuer_name
-    else:
-        label = "UnknownAccount"
-    
-    encoded_label = urllib.parse.quote(label)
-
+    issuer = title.strip()
+    account = username.strip()
+    label = (
+        f"{issuer}:{account}"
+        if issuer and account
+        else account or issuer or "UnknownAccount"
+    )
     params = {
-        'secret': cleaned_secret,
-        'algorithm': 'SHA1', # Common default
-        'digits': '6',     # Common default
-        'period': '30'     # Common default
+        "secret": cleaned_secret,
+        "algorithm": "SHA1",
+        "digits": "6",
+        "period": "30",
     }
-    if issuer_name: # Add issuer parameter, helpful for many authenticators
-        params['issuer'] = issuer_name
-
-    query_string = urllib.parse.urlencode(params)
-    
-    return f"otpauth://totp/{encoded_label}?{query_string}"
-
-
-def transform_enpass_csv_to_apple(input_filepath: str, output_filepath: str) -> None:
-    """Converts an Enpass CSV export file to an Apple Passwords compatible CSV file.
-
-    This function reads an Enpass CSV, maps known fields to Apple's expected
-    format (Title, URL, Username, Password, OTPAuth URL, Notes), generates
-    OTPAuth URLs from TOTP secrets, and consolidates any unmapped Enpass
-    fields into the 'Notes' column of the output CSV.
-
-    The Enpass CSV is expected to have a header row. Field names are matched
-    case-insensitively based on `ENPASS_FIELD_MAPPINGS`.
-
-    Args:
-        input_filepath: Path to the Enpass CSV export file.
-        output_filepath: Path where the Apple Passwords compatible CSV will be saved.
-
-    Raises:
-        FileNotFoundError: If the input_filepath does not exist.
-        IOError: If there are issues reading the input file or writing the output file.
-        csv.Error: If the input CSV is malformed or the header is not found.
-        Exception: For other unexpected errors during processing.
-    """
-    print(f"Starting conversion from '{input_filepath}' to '{output_filepath}'...")
-
-    try:
-        with open(input_filepath, 'r', encoding='utf-8-sig') as infile, \
-             open(output_filepath, 'w', newline='', encoding='utf-8') as outfile:
-
-            csv_reader = csv.reader(infile)
-            csv_writer = csv.writer(outfile)
-
-            csv_writer.writerow(APPLE_CSV_HEADER)
-
-            try:
-                enpass_header_original: List[str] = next(csv_reader)
-            except StopIteration:
-                print(f"Error: Input CSV file '{input_filepath}' is empty or has no header row.")
-                raise csv.Error("CSV file has no header row.") from None
-            
-            # Detect key-value export (no real header row) by checking first cell
-            header_first = enpass_header_original[0].strip()
-            title_opts_lower = [opt.lower() for opt in ENPASS_FIELD_MAPPINGS['Title']]
-            if header_first.lower() not in title_opts_lower:
-                # Key-value CSV export: each row is Title followed by alternating label/value cells
-                for row in itertools.chain([enpass_header_original], csv_reader):
-                    title = row[0].strip()
-                    entry: Dict[str, str] = {'Title': title, 'Notes': ''}
-                    extra_notes: List[str] = []
-                    # Process label/value pairs
-                    for i in range(1, len(row), 2):
-                        label = row[i].strip()
-                        value = row[i+1].strip() if i+1 < len(row) else ''
-                        if not label or not value:
-                            continue
-                        mapped = False
-                        for apple_key2, options2 in ENPASS_FIELD_MAPPINGS.items():
-                            if label in options2:
-                                entry[apple_key2] = value
-                                mapped = True
-                                break
-                        if not mapped:
-                            extra_notes.append(f"{label}: {value}")
-                    otpauth_url = generate_otpauth_url(entry.get('TOTP', ''), title, entry.get('Username', ''))
-                    consolidated_notes = '\n'.join(filter(None, [entry.get('Notes', ''), *extra_notes]))
-                    csv_writer.writerow([
-                        title,
-                        entry.get('URL', ''),
-                        entry.get('Username', ''),
-                        entry.get('Password', ''),
-                        consolidated_notes,
-                        otpauth_url
-                    ])
-                return
-             
-            enpass_header_stripped: List[str] = [h.strip() for h in enpass_header_original]
-            enpass_header_lower: List[str] = [h.lower() for h in enpass_header_stripped]
-             
-            header_to_index: Dict[str, int] = {name_lower: i for i, name_lower in enumerate(enpass_header_lower)}
-
-            apple_field_indices: Dict[str, int] = {} # Maps Apple field name to Enpass column index
-            mapped_enpass_col_indices: Set[int] = set()
-
-            for apple_key, enpass_options in ENPASS_FIELD_MAPPINGS.items():
-                 found_index = -1
-                 for option in enpass_options:
-                     option_lower = option.lower()
-                     if option_lower in header_to_index:
-                         found_index = header_to_index[option_lower]
-                         # Only add to mapped_enpass_col_indices if it's not already used by another primary mapping
-                         # This prevents, for example, a generic "Name" field being consumed by "Title"
-                         # and then also by "Username" if "Name" was an option for both.
-                         # The first ENPASS_FIELD_MAPPINGS key to match a column takes precedence for that column.
-                         if found_index not in mapped_enpass_col_indices:
-                              mapped_enpass_col_indices.add(found_index)
-                         break 
-                 apple_field_indices[apple_key] = found_index
-                 if found_index == -1:
-                     print(f"Info: No direct column found in Enpass CSV for Apple field '{apple_key}' "
-                           f"using mapping options: {enpass_options}.")
-
-            # If no primary mapping found, treat as key-value export format
-            if not mapped_enpass_col_indices:
-                 # Key-value CSV export: each row is Title followed by alternating label/value cells
-                 for row in itertools.chain([enpass_header_original], csv_reader):
-                     title = row[0].strip()
-                     entry: Dict[str, str] = {'Title': title, 'Notes': ''}
-                     extra_notes: List[str] = []
-                     # Process label/value pairs
-                     for i in range(1, len(row), 2):
-                         label = row[i].strip()
-                         value = row[i+1].strip() if i+1 < len(row) else ''
-                         if not label or not value:
-                             continue
-                         mapped = False
-                         for apple_key2, options2 in ENPASS_FIELD_MAPPINGS.items():
-                             if label in options2:
-                                 entry[apple_key2] = value
-                                 mapped = True
-                                 break
-                         if not mapped:
-                             extra_notes.append(f"{label}: {value}")
-                     otpauth_url = generate_otpauth_url(entry.get('TOTP', ''), title, entry.get('Username', ''))
-                     consolidated_notes = '\n'.join(filter(None, [entry.get('Notes', ''), *extra_notes]))
-                     csv_writer.writerow([
-                         title,
-                         entry.get('URL', ''),
-                         entry.get('Username', ''),
-                         entry.get('Password', ''),
-                         consolidated_notes,
-                         otpauth_url
-                     ])
-                 return
-             
-            processed_rows = 0
-            for row_num, row_data in enumerate(csv_reader, start=2):
-                if not any(field.strip() for field in row_data):
-                    print(f"Info: Skipping empty row {row_num}.")
-                    continue
-
-                if len(row_data) < len(enpass_header_original):
-                    row_data.extend([''] * (len(enpass_header_original) - len(row_data)))
-                elif len(row_data) > len(enpass_header_original):
-                    print(f"Warning: Row {row_num} has more columns ({len(row_data)}) than header "
-                          f"({len(enpass_header_original)}). Extra data will be ignored if unnamed.")
-                    row_data = row_data[:len(enpass_header_original)]
+    if issuer:
+        params["issuer"] = issuer
+    return (
+        f"otpauth://totp/{urllib.parse.quote(label)}?{urllib.parse.urlencode(params)}"
+    )
 
 
-                def get_field_value(apple_key: str) -> str:
-                    idx = apple_field_indices.get(apple_key, -1)
-                    return row_data[idx].strip() if idx != -1 and idx < len(row_data) else ""
+def _entry_from_fields(
+    *,
+    title: str,
+    notes: str,
+    fields: Iterable[Mapping[str, object]],
+    attachment_count: int = 0,
+    updated_at: int | None = None,
+    uuid: str = "",
+) -> Entry:
+    values: dict[str, str] = {}
+    extra_notes: list[str] = []
 
-                title_val = get_field_value('Title')
-                url_val = get_field_value('URL')
-                username_val = get_field_value('Username')
-                # Passwords should generally not be stripped of leading/trailing whitespace
-                password_idx = apple_field_indices.get('Password', -1)
-                password_val = row_data[password_idx] if password_idx != -1 and password_idx < len(row_data) else ""
-                
-                totp_secret_val = get_field_value('TOTP')
-                enpass_notes_val = get_field_value('Notes')
+    for field in fields:
+        if field.get("deleted"):
+            continue
+        label = str(field.get("label", "")).strip()
+        raw_value = field.get("value", "")
+        if not isinstance(raw_value, str):
+            continue
+        mapped = _mapped_field(label, str(field.get("type", "")))
+        value = raw_value if mapped == "Password" else raw_value.strip()
+        if not label or not value:
+            continue
+        if mapped and mapped not in values:
+            values[mapped] = value
+        elif field.get("type") != "section":
+            extra_notes.append(f"{label}: {value}")
 
-                otpauth_url = generate_otpauth_url(totp_secret_val, title_val, username_val)
+    return Entry(
+        title=title,
+        url=values.get("URL", ""),
+        username=values.get("Username", ""),
+        password=values.get("Password", ""),
+        notes=notes,
+        totp=values.get("TOTP", ""),
+        extra_notes=tuple(extra_notes),
+        attachment_count=attachment_count,
+        updated_at=updated_at,
+        uuid=uuid,
+    )
 
-                additional_notes_list: List[str] = []
-                if enpass_notes_val:
-                    additional_notes_list.append(enpass_notes_val)
 
-                for i, cell_value_unstripped in enumerate(row_data):
-                    cell_value = cell_value_unstripped.strip()
-                    if i not in mapped_enpass_col_indices and cell_value:
-                        original_field_name = enpass_header_stripped[i] if i < len(enpass_header_stripped) else f"Unnamed Field {i+1}"
-                        additional_notes_list.append(f"{original_field_name}: {cell_value}")
-                
-                consolidated_notes = "\n".join(filter(None, additional_notes_list))
+def parse_enpass_json(
+    input_filepath: str | Path,
+    *,
+    include_archived: bool = False,
+    include_trashed: bool = False,
+) -> list[Entry]:
+    """Parse an Enpass JSON export into normalized entries."""
+    with Path(input_filepath).open(encoding="utf-8") as source:
+        data = json.load(source)
+    if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+        raise ValueError("Invalid Enpass JSON export")
 
-                csv_writer.writerow([
-                    title_val,
-                    url_val,
-                    username_val,
-                    password_val, # Keep original password spacing
-                    consolidated_notes,
-                    otpauth_url
-                ])
-                processed_rows += 1
-            
-            if processed_rows == 0 and row_num > 1: # Header was read but no data rows
-                 print("Warning: CSV file contained a header but no data rows to process.")
-            elif processed_rows > 0:
-                print(f"Conversion successful. Processed {processed_rows} data rows.")
-            else: # No header and no data rows (already caught, but for completeness)
-                print("Warning: No data processed from the CSV file.")
+    entries: list[Entry] = []
+    for item in data.get("items", []):
+        if not isinstance(item, dict):
+            raise ValueError("Invalid item in Enpass JSON export")
+        if (item.get("archived") and not include_archived) or (
+            item.get("trashed") and not include_trashed
+        ):
+            continue
+        fields = item.get("fields", [])
+        if not isinstance(fields, list) or not all(
+            isinstance(field, dict) for field in fields
+        ):
+            raise ValueError("Invalid fields in Enpass JSON export")
+        attachments = item.get("attachments", [])
+        if not isinstance(attachments, list):
+            raise ValueError("Invalid attachments in Enpass JSON export")
+        timestamp = item.get("updated_at")
+        entries.append(
+            _entry_from_fields(
+                title=str(item.get("title", "")),
+                notes=str(item.get("note", "")),
+                fields=fields,
+                attachment_count=len(attachments),
+                updated_at=timestamp
+                if isinstance(timestamp, int) and not isinstance(timestamp, bool)
+                else None,
+                uuid=str(item.get("uuid", "")),
+            )
+        )
+    return entries
 
-            print(f"Output saved to '{output_filepath}'.")
 
-    except FileNotFoundError:
-        print(f"Fatal Error: Input file '{input_filepath}' not found.")
-        raise
-    except IOError as e:
-        print(f"Fatal Error: Could not read from '{input_filepath}' or write to '{output_filepath}'. Details: {e}")
-        raise
-    except csv.Error as e: # Catches issues from csv.reader or if next() fails on empty reader
-        print(f"Fatal Error: Problem parsing CSV data in '{input_filepath}'. Details: {e}")
-        raise
-    except Exception as e:
-        print(f"An unexpected fatal error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+def _entry_from_key_value_row(row: Sequence[str]) -> Entry:
+    fields = (
+        {
+            "label": row[index].strip(),
+            "value": row[index + 1] if index + 1 < len(row) else "",
+        }
+        for index in range(1, len(row), 2)
+    )
+    return _entry_from_fields(
+        title=row[0].strip() if row else "", notes="", fields=fields
+    )
 
-def parse_enpass_json(input_filepath: str) -> list:
-    """Parse Enpass JSON export and return a list of dicts with normalized fields."""
-    with open(input_filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    items = data.get('items', [])
-    result = []
-    for item in items:
-        entry = {}
-        entry['Title'] = item.get('title', '')
-        entry['Notes'] = item.get('note', '')
-        # Map fields
-        fields = item.get('fields', [])
-        for field in fields:
-            if field.get('deleted', 0):
-                continue
-            label = field.get('label', '').strip()
-            value = field.get('value', '').strip()
-            if not label or not value:
-                continue
-            # Try to map to Apple fields
-            for apple_key, enpass_options in ENPASS_FIELD_MAPPINGS.items():
-                if label in enpass_options:
-                    entry[apple_key] = value
+
+def parse_enpass_csv(input_filepath: str | Path) -> list[Entry]:
+    """Parse header-based or Enpass key/value CSV exports."""
+    with Path(input_filepath).open(newline="", encoding="utf-8-sig") as source:
+        reader = csv.reader(source)
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            raise csv.Error("CSV file has no rows") from None
+        if not first_row:
+            raise csv.Error("CSV file has an empty first row")
+
+        title_labels = {label.casefold() for label in ENPASS_FIELD_MAPPINGS["Title"]}
+        if first_row[0].strip().casefold() not in title_labels:
+            return [
+                _entry_from_key_value_row(row)
+                for row in itertools.chain([first_row], reader)
+                if any(cell.strip() for cell in row)
+            ]
+
+        header = [name.strip() for name in first_row]
+        indices = {name.casefold(): index for index, name in enumerate(header)}
+        mapped_indices: dict[str, int] = {}
+        for name, options in ENPASS_FIELD_MAPPINGS.items():
+            for option in options:
+                if option.casefold() in indices:
+                    mapped_indices[name] = indices[option.casefold()]
                     break
-            # Always keep all fields for extra notes
-            entry.setdefault('_extra', []).append(f"{label}: {value}")
-        result.append(entry)
-    return result
+
+        entries: list[Entry] = []
+        for row in reader:
+            if not any(cell.strip() for cell in row):
+                continue
+            row = [*row, *([""] * max(0, len(header) - len(row)))]
+
+            def value(name: str, *, strip: bool = True) -> str:
+                index = mapped_indices.get(name)
+                if index is None or index >= len(row):
+                    return ""
+                return row[index].strip() if strip else row[index]
+
+            used = set(mapped_indices.values())
+            extras = tuple(
+                f"{header[index]}: {cell.strip()}"
+                for index, cell in enumerate(row[: len(header)])
+                if index not in used and cell.strip()
+            )
+            entries.append(
+                Entry(
+                    title=value("Title"),
+                    url=value("URL"),
+                    username=value("Username"),
+                    password=value("Password", strip=False),
+                    notes=value("Notes"),
+                    totp=value("TOTP"),
+                    extra_notes=extras,
+                )
+            )
+        return entries
 
 
-def write_apple_csv_from_dicts(dicts: list, output_filepath: str):
-    """Write list of entry dicts to an Apple CSV file."""
-    with open(output_filepath, 'w', newline='', encoding='utf-8') as outfile:
-        csv_writer = csv.writer(outfile)
-        csv_writer.writerow(APPLE_CSV_HEADER)
-        for entry in dicts:
-            title = entry.get('Title', '')
-            url = entry.get('URL', '')
-            username = entry.get('Username', '')
-            password = entry.get('Password', '')
-            totp = entry.get('TOTP', '')
-            notes = entry.get('Notes', '')
-            otpauth_url = generate_otpauth_url(totp, title, username)
-            extra_notes = '\n'.join(entry.get('_extra', []))
-            consolidated_notes = '\n'.join(filter(None, [notes, extra_notes]))
-            csv_writer.writerow([
-                title, url, username, password, consolidated_notes, otpauth_url
-            ])
+def parse_enpass(
+    input_filepath: str | Path,
+    *,
+    include_archived: bool = False,
+    include_trashed: bool = False,
+) -> list[Entry]:
+    suffix = Path(input_filepath).suffix.casefold()
+    if suffix == ".json":
+        return parse_enpass_json(
+            input_filepath,
+            include_archived=include_archived,
+            include_trashed=include_trashed,
+        )
+    if suffix == ".csv":
+        return parse_enpass_csv(input_filepath)
+    raise ValueError("Input must be an Enpass .json or .csv export")
 
 
-def transform_enpass_to_apple(input_filepath: str, output_filepath: str):
-    """Detects file type (csv or json) and converts to Apple Passwords CSV."""
-    if input_filepath.lower().endswith('.json'):
-        dicts = parse_enpass_json(input_filepath)
-        write_apple_csv_from_dicts(dicts, output_filepath)
+def _content_key(entry: Entry) -> tuple[object, ...]:
+    return (
+        entry.title,
+        entry.url,
+        entry.username,
+        entry.password,
+        entry.notes,
+        entry.totp,
+        entry.extra_notes,
+        entry.attachment_count,
+    )
+
+
+def _account_key(entry: Entry) -> tuple[str, str] | None:
+    try:
+        parts = urllib.parse.urlsplit(entry.url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname or not entry.username:
+        return None
+
+    scheme = parts.scheme.casefold()
+    hostname = parts.hostname.casefold()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = hostname if port is None or default_port else f"{hostname}:{port}"
+    normalized_url = urllib.parse.urlunsplit(
+        (scheme, netloc, parts.path or "/", parts.query, "")
+    )
+    return normalized_url, entry.username.casefold()
+
+
+def deduplicate(
+    entries: Sequence[Entry], policy: DuplicatePolicy = DuplicatePolicy.NEWEST
+) -> DeduplicationResult:
+    """Remove only duplicates that can be resolved without guessing."""
+    if policy == DuplicatePolicy.KEEP:
+        return DeduplicationResult(tuple(entries))
+
+    if policy == DuplicatePolicy.EXACT:
+        unique: dict[tuple[object, ...], Entry] = {}
+        for entry in entries:
+            content_key = _content_key(entry)
+            current = unique.get(content_key)
+            if current is None or (entry.updated_at or -1) > (current.updated_at or -1):
+                unique[content_key] = entry
+        return DeduplicationResult(tuple(unique.values()), len(entries) - len(unique))
+
+    groups: dict[tuple[str, str], list[tuple[int, Entry]]] = {}
+    selected_indices: set[int] = set()
+    for index, entry in enumerate(entries):
+        if account_key := _account_key(entry):
+            groups.setdefault(account_key, []).append((index, entry))
+        else:
+            selected_indices.add(index)
+
+    removed = 0
+    conflicts = 0
+    for group in groups.values():
+        if len(group) == 1:
+            selected_indices.add(group[0][0])
+            continue
+        if len({_content_key(entry) for _, entry in group}) == 1:
+            selected_indices.add(
+                max(group, key=lambda item: item[1].updated_at or -1)[0]
+            )
+            removed += len(group) - 1
+            continue
+        if all(entry.updated_at is not None for _, entry in group):
+            newest_timestamp = max(
+                entry.updated_at for _, entry in group if entry.updated_at is not None
+            )
+            newest = [item for item in group if item[1].updated_at == newest_timestamp]
+            if len(newest) == 1:
+                selected_indices.add(newest[0][0])
+                removed += len(group) - 1
+                continue
+        selected_indices.update(index for index, _ in group)
+        conflicts += 1
+    return DeduplicationResult(
+        tuple(
+            entry for index, entry in enumerate(entries) if index in selected_indices
+        ),
+        removed,
+        conflicts,
+    )
+
+
+def _write_csv(
+    output_filepath: str | Path,
+    header: Sequence[str],
+    rows: Iterable[Sequence[str]],
+    *,
+    force: bool = False,
+) -> None:
+    output = Path(output_filepath)
+    if output.exists() and not force:
+        raise FileExistsError(f"Output already exists: {output}")
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", dir=output.parent
+    )
+    try:
+        with os.fdopen(
+            file_descriptor, "w", newline="", encoding="utf-8"
+        ) as destination:
+            writer = csv.writer(destination)
+            writer.writerow(header)
+            writer.writerows(rows)
+        os.replace(temporary_name, output)
+        os.chmod(output, 0o600)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _notes(entry: Entry) -> str:
+    return "\n".join(part for part in (entry.notes, *entry.extra_notes) if part)
+
+
+def write_apple_csv(
+    entries: Iterable[Entry], output_filepath: str | Path, *, force: bool = False
+) -> None:
+    _write_csv(
+        output_filepath,
+        APPLE_CSV_HEADER,
+        (
+            (
+                entry.title,
+                entry.url,
+                entry.username,
+                entry.password,
+                _notes(entry),
+                generate_otpauth_url(entry.totp, entry.title, entry.username),
+            )
+            for entry in entries
+        ),
+        force=force,
+    )
+
+
+def google_website_entries(
+    entries: Iterable[Entry],
+) -> tuple[list[Entry], Counter[str]]:
+    """Keep credentials that Google can import as website passwords."""
+    accepted: list[Entry] = []
+    skipped: Counter[str] = Counter()
+    for entry in entries:
+        if not entry.password:
+            skipped["missing password"] += 1
+            continue
+        try:
+            url = urllib.parse.urlsplit(entry.url)
+        except ValueError:
+            url = urllib.parse.SplitResult("", "", "", "", "")
+        if url.scheme.casefold() not in {"http", "https"} or not url.hostname:
+            skipped["invalid website URL"] += 1
+            continue
+        accepted.append(entry)
+    return accepted, skipped
+
+
+def _google_note(entry: Entry) -> str:
+    return "\n".join(
+        part
+        for part in (f"Title: {entry.title}" if entry.title else "", entry.notes)
+        if part
+    )
+
+
+def write_google_csv(
+    entries: Sequence[Entry], output_filepath: str | Path, *, force: bool = False
+) -> tuple[Path, ...]:
+    """Write Google Password Manager CSV files, splitting at its import limit."""
+    output = Path(output_filepath)
+    chunks = [
+        entries[index : index + GOOGLE_IMPORT_LIMIT]
+        for index in range(0, len(entries), GOOGLE_IMPORT_LIMIT)
+    ] or [[]]
+    if len(chunks) == 1:
+        paths = [output]
     else:
-        transform_enpass_csv_to_apple(input_filepath, output_filepath)
+        suffix = output.suffix or ".csv"
+        stem = output.stem if output.suffix else output.name
+        paths = [
+            output.with_name(f"{stem}-{index}{suffix}")
+            for index in range(1, len(chunks) + 1)
+        ]
+
+    existing = [path for path in paths if path.exists()]
+    if existing and not force:
+        raise FileExistsError(f"Output already exists: {existing[0]}")
+
+    # ponytail: multi-part exports are atomic per file; add batch rollback only if partial disk failures matter.
+    for path, chunk in zip(paths, chunks, strict=True):
+        _write_csv(
+            path,
+            GOOGLE_CSV_HEADER,
+            (
+                (entry.url, entry.username, entry.password, _google_note(entry))
+                for entry in chunk
+            ),
+            force=force,
+        )
+    return tuple(paths)
+
+
+def write_apple_csv_from_dicts(
+    dicts: Iterable[Mapping[str, object]],
+    output_filepath: str | Path,
+    *,
+    force: bool = False,
+) -> None:
+    """Compatibility wrapper for the original public helper."""
+
+    def from_mapping(item: Mapping[str, object]) -> Entry:
+        raw_extra_notes = item.get("_extra", [])
+        extra_notes = (
+            tuple(str(note) for note in raw_extra_notes)
+            if isinstance(raw_extra_notes, (list, tuple))
+            else ()
+        )
+        return Entry(
+            title=str(item.get("Title", "")),
+            url=str(item.get("URL", "")),
+            username=str(item.get("Username", "")),
+            password=str(item.get("Password", "")),
+            notes=str(item.get("Notes", "")),
+            totp=str(item.get("TOTP", "")),
+            extra_notes=extra_notes,
+        )
+
+    entries = (from_mapping(item) for item in dicts)
+    write_apple_csv(entries, output_filepath, force=force)
+
+
+def transform_enpass_csv_to_apple(
+    input_filepath: str | Path, output_filepath: str | Path, *, force: bool = False
+) -> None:
+    write_apple_csv(parse_enpass_csv(input_filepath), output_filepath, force=force)
+
+
+def transform_enpass_to_apple(
+    input_filepath: str | Path,
+    output_filepath: str | Path,
+    *,
+    include_archived: bool = False,
+    include_trashed: bool = False,
+    force: bool = False,
+) -> None:
+    write_apple_csv(
+        parse_enpass(
+            input_filepath,
+            include_archived=include_archived,
+            include_trashed=include_trashed,
+        ),
+        output_filepath,
+        force=force,
+    )
 
 
 def main(
     enpass_input_file: str = typer.Argument(
-        None, help="Path to your Enpass export CSV or JSON file.", show_default=False
+        "export-enpass.csv", help="Path to your Enpass export CSV or JSON file."
     ),
-    apple_output_file: str = typer.Argument(
-        None, help="Desired output file path for Apple Passwords import.", show_default=False
+    output_file: str | None = typer.Argument(
+        None, help="Output CSV path. A target-specific name is used by default."
     ),
-):
-    """Convert Enpass CSV or JSON export to Apple Passwords compatible CSV."""
-    if not enpass_input_file:
-        enpass_input_file = "export-enpass.csv"
-        typer.secho(f"No input file specified. Using default: {enpass_input_file}", fg=typer.colors.YELLOW)
-    if not apple_output_file:
-        apple_output_file = "export-apple-passwords.csv"
-        typer.secho(f"No output file specified. Using default: {apple_output_file}", fg=typer.colors.YELLOW)
+    target: Target = typer.Option(Target.APPLE, help="Password manager to export for."),
+    duplicates: DuplicatePolicy = typer.Option(
+        DuplicatePolicy.NEWEST, help="How duplicate credentials are handled."
+    ),
+    include_archived: bool = typer.Option(
+        False, help="Include archived Enpass entries."
+    ),
+    include_trashed: bool = typer.Option(False, help="Include trashed Enpass entries."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Analyze without writing files."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Replace an existing output file."
+    ),
+) -> None:
+    """Convert an Enpass export to Apple or Google Password Manager CSV."""
     try:
-        transform_enpass_to_apple(enpass_input_file, apple_output_file)
-    except Exception as e:
-        typer.secho(f"Script failed with an error. See details above. {e}", fg=typer.colors.RED)
-        raise typer.Exit(code=1)
+        entries = parse_enpass(
+            enpass_input_file,
+            include_archived=include_archived,
+            include_trashed=include_trashed,
+        )
+        deduplicated = deduplicate(entries, duplicates)
+        export_entries = list(deduplicated.entries)
+        skip_reasons: Counter[str] = Counter()
+        skipped_totp = 0
+        skipped_attachments = sum(entry.attachment_count for entry in entries)
+        if target == Target.GOOGLE:
+            skipped_totp = sum(bool(entry.totp) for entry in export_entries)
+            export_entries, skip_reasons = google_website_entries(export_entries)
 
-app = typer.Typer()
+        typer.echo(
+            f"Read: {len(entries)} | Export: {len(export_entries)} | "
+            f"Duplicates removed: {deduplicated.removed} | "
+            f"Conflicts kept: {deduplicated.conflicts}"
+        )
+        skipped = sum(skip_reasons.values())
+        details = ", ".join(
+            f"{reason}: {count}" for reason, count in skip_reasons.items()
+        )
+        typer.echo(f"Skipped: {skipped}" + (f" ({details})" if details else ""))
+        typer.echo(
+            f"Not migrated: TOTP: {skipped_totp} | Attachments: {skipped_attachments}"
+        )
+        if dry_run:
+            typer.echo("Dry run: no files created.")
+            return
 
-@app.callback(invoke_without_command=True)
-def cli(
-    enpass_input_file: str = typer.Argument(
-        None, help="Path to your Enpass export CSV or JSON file.", show_default=False
-    ),
-    apple_output_file: str = typer.Argument(
-        None, help="Desired output file path for Apple Passwords import.", show_default=False
-    ),
-):
-    """Convert Enpass CSV or JSON export to Apple Passwords compatible CSV."""
-    main(enpass_input_file, apple_output_file)
+        destination = output_file or f"export-{target.value}-passwords.csv"
+        if target == Target.GOOGLE:
+            paths = write_google_csv(export_entries, destination, force=force)
+        else:
+            write_apple_csv(export_entries, destination, force=force)
+            paths = (Path(destination),)
+        typer.echo(f"Created: {', '.join(str(path) for path in paths)}")
+    except (OSError, ValueError, csv.Error, json.JSONDecodeError) as error:
+        typer.secho(f"Conversion failed: {error}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from error
+
+
+app = typer.Typer(add_completion=False)
+app.command()(main)
+
 
 if __name__ == "__main__":
     app()
