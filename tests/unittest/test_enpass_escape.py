@@ -4,6 +4,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from enpass_escape import cli
 
@@ -103,3 +104,102 @@ def test_output_is_not_overwritten_without_force(tmp_path: Path) -> None:
 def test_unknown_input_format_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r"\.json or \.csv"):
         cli.parse_enpass(tmp_path / "export.txt")
+
+
+def test_newest_duplicate_wins() -> None:
+    older = cli.Entry(
+        title="Old",
+        url="https://EXAMPLE.com:443/login",
+        username="User",
+        password="old",
+        updated_at=1,
+    )
+    newer = cli.Entry(
+        title="New",
+        url="https://example.com/login",
+        username="user",
+        password="new",
+        updated_at=2,
+    )
+
+    result = cli.deduplicate([older, newer])
+
+    assert result.entries == (newer,)
+    assert result.removed == 1
+    assert result.conflicts == 0
+
+
+def test_ambiguous_duplicate_is_kept() -> None:
+    first = cli.Entry(
+        url="https://example.com", username="user", password="one", updated_at=1
+    )
+    second = cli.Entry(
+        url="https://example.com/", username="USER", password="two", updated_at=1
+    )
+
+    result = cli.deduplicate([first, second])
+
+    assert result.entries == (first, second)
+    assert result.removed == 0
+    assert result.conflicts == 1
+
+
+def test_exact_duplicates_do_not_need_timestamps() -> None:
+    entry = cli.Entry(url="https://example.com", username="user", password="same")
+
+    result = cli.deduplicate([entry, entry], cli.DuplicatePolicy.EXACT)
+
+    assert result.entries == (entry,)
+    assert result.removed == 1
+
+
+def test_google_export_contains_only_website_passwords(tmp_path: Path) -> None:
+    website = cli.Entry(
+        title="Example",
+        url="https://example.com",
+        username="user",
+        password="secret",
+        notes="note",
+        totp="JBSWY3DPEHPK3PXP",
+    )
+    entries, skipped = cli.google_website_entries(
+        [
+            website,
+            cli.Entry(url="android://app", password="secret"),
+            cli.Entry(url="https://empty"),
+        ]
+    )
+    output = tmp_path / "google.csv"
+
+    paths = cli.write_google_csv(entries, output)
+
+    assert paths == (output,)
+    assert skipped == 2
+    assert read_csv(output) == [
+        cli.GOOGLE_CSV_HEADER,
+        ["https://example.com", "user", "secret", "Title: Example\nnote"],
+    ]
+
+
+def test_google_export_splits_at_import_limit(tmp_path: Path) -> None:
+    entries = [
+        cli.Entry(url=f"https://example.com/{index}", password="secret")
+        for index in range(cli.GOOGLE_IMPORT_LIMIT + 1)
+    ]
+
+    paths = cli.write_google_csv(entries, tmp_path / "google.csv")
+
+    assert [path.name for path in paths] == ["google-1.csv", "google-2.csv"]
+    assert len(read_csv(paths[0])) == cli.GOOGLE_IMPORT_LIMIT + 1
+    assert len(read_csv(paths[1])) == 2
+
+
+def test_google_dry_run_writes_nothing() -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [str(ENPASS_JSON), "--target", "google", "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert "TOTP not migrated 1" in result.output
+    assert "Created:" not in result.output

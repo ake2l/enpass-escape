@@ -1,10 +1,12 @@
 # Enpass-Escape
 
-A lightweight Python CLI to migrate passwords from Enpass to Apple Passwords. It supports CSV and JSON exports, preserves TOTP secrets, and consolidates extra fields into notes.
+A lightweight Python CLI to migrate Enpass website passwords to Apple Passwords or Google Password Manager.
 
 ## 🚀 Features
 
 - Converts Enpass CSV or JSON export to Apple Passwords import CSV
+- Converts website passwords to Google Password Manager CSV
+- Keeps the newest safely identifiable duplicate by default
 - Preserves TOTP/2FA secrets with proper otpauth URI formatting
 - Maintains titles, URLs, usernames, passwords, and notes
 - Combines any additional fields into organized notes
@@ -45,6 +47,15 @@ enpass-escape enpass-export.csv export-apple-passwords.csv
 # JSON-to-CSV
 enpass-escape export.json apple-output.csv
 
+# Google Password Manager; website passwords only
+enpass-escape export.json google-output.csv --target google
+
+# Analyze without creating a plaintext export
+enpass-escape export.json --target google --dry-run
+
+# Keep all duplicates
+enpass-escape export.json apple-output.csv --duplicates keep
+
 # Include archived items
 enpass-escape export.json apple-output.csv --include-archived
 
@@ -66,13 +77,29 @@ Title,URL,Username,Password,Notes,OTPAuth
 - **JSON (recommended)**: Enpass JSON export (recommended for complete data export)
 - **CSV**: Standard Enpass CSV export (limited field support)
 
-### Output Format
+### Output Formats
 
 Apple Passwords import CSV with the following columns:
 
 ```csv
 Title,URL,Username,Password,Notes,OTPAuth
 ```
+
+Google Password Manager CSV:
+
+```csv
+url,username,password,note
+```
+
+Google exports contain only entries with an HTTP(S) URL and a password. Files are split automatically at Google's 3,000-entry import limit. TOTP secrets and passkeys are not exported to Google.
+
+### Duplicates
+
+- `newest` (default): keep the entry with the highest Enpass `updated_at` for the same normalized URL and username
+- `exact`: remove only entries with identical migrated content
+- `keep`: do not remove duplicates
+
+Entries with missing or tied timestamps are kept when their content differs. CSV exports usually have no timestamps, so JSON is recommended for `newest`.
 
 ## 🔒 Security Considerations
 

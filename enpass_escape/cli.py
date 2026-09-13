@@ -10,6 +10,7 @@ import urllib.parse
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import typer
@@ -38,6 +39,19 @@ FIELD_TYPE_MAPPINGS = {
     "totp": "TOTP",
 }
 APPLE_CSV_HEADER = ["Title", "URL", "Username", "Password", "Notes", "OTPAuth"]
+GOOGLE_CSV_HEADER = ["url", "username", "password", "note"]
+GOOGLE_IMPORT_LIMIT = 3_000
+
+
+class Target(StrEnum):
+    APPLE = "apple"
+    GOOGLE = "google"
+
+
+class DuplicatePolicy(StrEnum):
+    KEEP = "keep"
+    EXACT = "exact"
+    NEWEST = "newest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +65,13 @@ class Entry:
     extra_notes: tuple[str, ...] = ()
     updated_at: int | None = None
     uuid: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DeduplicationResult:
+    entries: tuple[Entry, ...]
+    removed: int = 0
+    conflicts: int = 0
 
 
 def _mapped_field(label: str, field_type: str = "") -> str | None:
@@ -272,6 +293,97 @@ def parse_enpass(
     raise ValueError("Input must be an Enpass .json or .csv export")
 
 
+def _content_key(entry: Entry) -> tuple[object, ...]:
+    return (
+        entry.title,
+        entry.url,
+        entry.username,
+        entry.password,
+        entry.notes,
+        entry.totp,
+        entry.extra_notes,
+    )
+
+
+def _account_key(entry: Entry) -> tuple[str, str] | None:
+    try:
+        parts = urllib.parse.urlsplit(entry.url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname or not entry.username:
+        return None
+
+    scheme = parts.scheme.casefold()
+    hostname = parts.hostname.casefold()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = hostname if port is None or default_port else f"{hostname}:{port}"
+    normalized_url = urllib.parse.urlunsplit(
+        (scheme, netloc, parts.path or "/", parts.query, "")
+    )
+    return normalized_url, entry.username.casefold()
+
+
+def deduplicate(
+    entries: Sequence[Entry], policy: DuplicatePolicy = DuplicatePolicy.NEWEST
+) -> DeduplicationResult:
+    """Remove only duplicates that can be resolved without guessing."""
+    if policy == DuplicatePolicy.KEEP:
+        return DeduplicationResult(tuple(entries))
+
+    if policy == DuplicatePolicy.EXACT:
+        unique: dict[tuple[object, ...], Entry] = {}
+        for entry in entries:
+            content_key = _content_key(entry)
+            current = unique.get(content_key)
+            if current is None or (entry.updated_at or -1) > (current.updated_at or -1):
+                unique[content_key] = entry
+        return DeduplicationResult(tuple(unique.values()), len(entries) - len(unique))
+
+    groups: dict[tuple[str, str], list[tuple[int, Entry]]] = {}
+    selected_indices: set[int] = set()
+    for index, entry in enumerate(entries):
+        if account_key := _account_key(entry):
+            groups.setdefault(account_key, []).append((index, entry))
+        else:
+            selected_indices.add(index)
+
+    removed = 0
+    conflicts = 0
+    for group in groups.values():
+        if len(group) == 1:
+            selected_indices.add(group[0][0])
+            continue
+        if len({_content_key(entry) for _, entry in group}) == 1:
+            selected_indices.add(
+                max(group, key=lambda item: item[1].updated_at or -1)[0]
+            )
+            removed += len(group) - 1
+            continue
+        if all(entry.updated_at is not None for _, entry in group):
+            newest_timestamp = max(
+                entry.updated_at for _, entry in group if entry.updated_at is not None
+            )
+            newest = [item for item in group if item[1].updated_at == newest_timestamp]
+            if len(newest) == 1:
+                selected_indices.add(newest[0][0])
+                removed += len(group) - 1
+                continue
+        selected_indices.update(index for index, _ in group)
+        conflicts += 1
+    return DeduplicationResult(
+        tuple(
+            entry for index, entry in enumerate(entries) if index in selected_indices
+        ),
+        removed,
+        conflicts,
+    )
+
+
 def _write_csv(
     output_filepath: str | Path,
     header: Sequence[str],
@@ -322,6 +434,71 @@ def write_apple_csv(
         ),
         force=force,
     )
+
+
+def google_website_entries(entries: Iterable[Entry]) -> tuple[list[Entry], int]:
+    """Keep credentials that Google can import as website passwords."""
+    accepted: list[Entry] = []
+    skipped = 0
+    for entry in entries:
+        try:
+            url = urllib.parse.urlsplit(entry.url)
+        except ValueError:
+            url = urllib.parse.SplitResult("", "", "", "", "")
+        if (
+            url.scheme.casefold() not in {"http", "https"}
+            or not url.hostname
+            or not entry.password
+        ):
+            skipped += 1
+            continue
+        accepted.append(entry)
+    return accepted, skipped
+
+
+def _google_note(entry: Entry) -> str:
+    return "\n".join(
+        part
+        for part in (f"Title: {entry.title}" if entry.title else "", _notes(entry))
+        if part
+    )
+
+
+def write_google_csv(
+    entries: Sequence[Entry], output_filepath: str | Path, *, force: bool = False
+) -> tuple[Path, ...]:
+    """Write Google Password Manager CSV files, splitting at its import limit."""
+    output = Path(output_filepath)
+    chunks = [
+        entries[index : index + GOOGLE_IMPORT_LIMIT]
+        for index in range(0, len(entries), GOOGLE_IMPORT_LIMIT)
+    ] or [[]]
+    if len(chunks) == 1:
+        paths = [output]
+    else:
+        suffix = output.suffix or ".csv"
+        stem = output.stem if output.suffix else output.name
+        paths = [
+            output.with_name(f"{stem}-{index}{suffix}")
+            for index in range(1, len(chunks) + 1)
+        ]
+
+    existing = [path for path in paths if path.exists()]
+    if existing and not force:
+        raise FileExistsError(f"Output already exists: {existing[0]}")
+
+    # ponytail: multi-part exports are atomic per file; add batch rollback only if partial disk failures matter.
+    for path, chunk in zip(paths, chunks, strict=True):
+        _write_csv(
+            path,
+            GOOGLE_CSV_HEADER,
+            (
+                (entry.url, entry.username, entry.password, _google_note(entry))
+                for entry in chunk
+            ),
+            force=force,
+        )
+    return tuple(paths)
 
 
 def write_apple_csv_from_dicts(
@@ -382,26 +559,55 @@ def main(
     enpass_input_file: str = typer.Argument(
         "export-enpass.csv", help="Path to your Enpass export CSV or JSON file."
     ),
-    apple_output_file: str = typer.Argument(
-        "export-apple-passwords.csv", help="Desired Apple Passwords CSV path."
+    output_file: str | None = typer.Argument(
+        None, help="Output CSV path. A target-specific name is used by default."
+    ),
+    target: Target = typer.Option(Target.APPLE, help="Password manager to export for."),
+    duplicates: DuplicatePolicy = typer.Option(
+        DuplicatePolicy.NEWEST, help="How duplicate credentials are handled."
     ),
     include_archived: bool = typer.Option(
         False, help="Include archived Enpass entries."
     ),
     include_trashed: bool = typer.Option(False, help="Include trashed Enpass entries."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Analyze without writing files."
+    ),
     force: bool = typer.Option(
         False, "--force", help="Replace an existing output file."
     ),
 ) -> None:
-    """Convert an Enpass CSV or JSON export to Apple Passwords CSV."""
+    """Convert an Enpass export to Apple or Google Password Manager CSV."""
     try:
-        transform_enpass_to_apple(
+        entries = parse_enpass(
             enpass_input_file,
-            apple_output_file,
             include_archived=include_archived,
             include_trashed=include_trashed,
-            force=force,
         )
+        deduplicated = deduplicate(entries, duplicates)
+        export_entries = list(deduplicated.entries)
+        skipped = 0
+        skipped_totp = 0
+        if target == Target.GOOGLE:
+            skipped_totp = sum(bool(entry.totp) for entry in export_entries)
+            export_entries, skipped = google_website_entries(export_entries)
+
+        typer.echo(
+            f"Read {len(entries)}; export {len(export_entries)}; "
+            f"duplicates removed {deduplicated.removed}; "
+            f"conflicts kept {deduplicated.conflicts}; skipped {skipped}; "
+            f"TOTP not migrated {skipped_totp}."
+        )
+        if dry_run:
+            return
+
+        destination = output_file or f"export-{target.value}-passwords.csv"
+        if target == Target.GOOGLE:
+            paths = write_google_csv(export_entries, destination, force=force)
+        else:
+            write_apple_csv(export_entries, destination, force=force)
+            paths = (Path(destination),)
+        typer.echo(f"Created: {', '.join(str(path) for path in paths)}")
     except (OSError, ValueError, csv.Error, json.JSONDecodeError) as error:
         typer.secho(f"Conversion failed: {error}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from error
