@@ -181,6 +181,29 @@ def test_google_export_contains_only_website_passwords(tmp_path: Path) -> None:
     ]
 
 
+def test_enpass_json_to_google_csv(tmp_path: Path) -> None:
+    source = tmp_path / "export.json"
+    output = tmp_path / "google.csv"
+    write_json(source, [login_item("Example")])
+
+    result = CliRunner().invoke(
+        cli.app,
+        [str(source), str(output), "--target", "google"],
+    )
+
+    assert result.exit_code == 0
+    assert "TOTP not migrated 1" in result.output
+    assert read_csv(output) == [
+        cli.GOOGLE_CSV_HEADER,
+        [
+            "https://example.com",
+            "user@example.com",
+            " password with spaces ",
+            "Title: Example\noriginal note\nCustom: kept",
+        ],
+    ]
+
+
 def test_google_export_splits_at_import_limit(tmp_path: Path) -> None:
     entries = [
         cli.Entry(url=f"https://example.com/{index}", password="secret")
