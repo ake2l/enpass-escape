@@ -83,11 +83,22 @@ def generate_otpauth_url(secret_key: str, title: str = "", username: str = "") -
 
     issuer = title.strip()
     account = username.strip()
-    label = f"{issuer}:{account}" if issuer and account else account or issuer or "UnknownAccount"
-    params = {"secret": cleaned_secret, "algorithm": "SHA1", "digits": "6", "period": "30"}
+    label = (
+        f"{issuer}:{account}"
+        if issuer and account
+        else account or issuer or "UnknownAccount"
+    )
+    params = {
+        "secret": cleaned_secret,
+        "algorithm": "SHA1",
+        "digits": "6",
+        "period": "30",
+    }
     if issuer:
         params["issuer"] = issuer
-    return f"otpauth://totp/{urllib.parse.quote(label)}?{urllib.parse.urlencode(params)}"
+    return (
+        f"otpauth://totp/{urllib.parse.quote(label)}?{urllib.parse.urlencode(params)}"
+    )
 
 
 def _entry_from_fields(
@@ -151,7 +162,9 @@ def parse_enpass_json(
         ):
             continue
         fields = item.get("fields", [])
-        if not isinstance(fields, list) or not all(isinstance(field, dict) for field in fields):
+        if not isinstance(fields, list) or not all(
+            isinstance(field, dict) for field in fields
+        ):
             raise ValueError("Invalid fields in Enpass JSON export")
         timestamp = item.get("updated_at")
         entries.append(
@@ -159,7 +172,9 @@ def parse_enpass_json(
                 title=str(item.get("title", "")),
                 notes=str(item.get("note", "")),
                 fields=fields,
-                updated_at=timestamp if isinstance(timestamp, int) and not isinstance(timestamp, bool) else None,
+                updated_at=timestamp
+                if isinstance(timestamp, int) and not isinstance(timestamp, bool)
+                else None,
                 uuid=str(item.get("uuid", "")),
             )
         )
@@ -168,10 +183,15 @@ def parse_enpass_json(
 
 def _entry_from_key_value_row(row: Sequence[str]) -> Entry:
     fields = (
-        {"label": row[index].strip(), "value": row[index + 1] if index + 1 < len(row) else ""}
+        {
+            "label": row[index].strip(),
+            "value": row[index + 1] if index + 1 < len(row) else "",
+        }
         for index in range(1, len(row), 2)
     )
-    return _entry_from_fields(title=row[0].strip() if row else "", notes="", fields=fields)
+    return _entry_from_fields(
+        title=row[0].strip() if row else "", notes="", fields=fields
+    )
 
 
 def parse_enpass_csv(input_filepath: str | Path) -> list[Entry]:
@@ -262,9 +282,13 @@ def _write_csv(
     output = Path(output_filepath)
     if output.exists() and not force:
         raise FileExistsError(f"Output already exists: {output}")
-    file_descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", dir=output.parent
+    )
     try:
-        with os.fdopen(file_descriptor, "w", newline="", encoding="utf-8") as destination:
+        with os.fdopen(
+            file_descriptor, "w", newline="", encoding="utf-8"
+        ) as destination:
             writer = csv.writer(destination)
             writer.writerow(header)
             writer.writerows(rows)
@@ -301,21 +325,31 @@ def write_apple_csv(
 
 
 def write_apple_csv_from_dicts(
-    dicts: Iterable[Mapping[str, object]], output_filepath: str | Path, *, force: bool = False
+    dicts: Iterable[Mapping[str, object]],
+    output_filepath: str | Path,
+    *,
+    force: bool = False,
 ) -> None:
     """Compatibility wrapper for the original public helper."""
-    entries = (
-        Entry(
+
+    def from_mapping(item: Mapping[str, object]) -> Entry:
+        raw_extra_notes = item.get("_extra", [])
+        extra_notes = (
+            tuple(str(note) for note in raw_extra_notes)
+            if isinstance(raw_extra_notes, (list, tuple))
+            else ()
+        )
+        return Entry(
             title=str(item.get("Title", "")),
             url=str(item.get("URL", "")),
             username=str(item.get("Username", "")),
             password=str(item.get("Password", "")),
             notes=str(item.get("Notes", "")),
             totp=str(item.get("TOTP", "")),
-            extra_notes=tuple(str(note) for note in item.get("_extra", []) if isinstance(note, str)),
+            extra_notes=extra_notes,
         )
-        for item in dicts
-    )
+
+    entries = (from_mapping(item) for item in dicts)
     write_apple_csv(entries, output_filepath, force=force)
 
 
@@ -351,9 +385,13 @@ def main(
     apple_output_file: str = typer.Argument(
         "export-apple-passwords.csv", help="Desired Apple Passwords CSV path."
     ),
-    include_archived: bool = typer.Option(False, help="Include archived Enpass entries."),
+    include_archived: bool = typer.Option(
+        False, help="Include archived Enpass entries."
+    ),
     include_trashed: bool = typer.Option(False, help="Include trashed Enpass entries."),
-    force: bool = typer.Option(False, "--force", help="Replace an existing output file."),
+    force: bool = typer.Option(
+        False, "--force", help="Replace an existing output file."
+    ),
 ) -> None:
     """Convert an Enpass CSV or JSON export to Apple Passwords CSV."""
     try:

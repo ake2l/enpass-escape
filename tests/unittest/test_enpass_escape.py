@@ -45,7 +45,9 @@ def login_item(
     }
 
 
-def test_json_parser_uses_types_without_copying_credentials_to_notes(tmp_path: Path) -> None:
+def test_json_parser_uses_types_without_copying_credentials_to_notes(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "export.json"
     write_json(source, [login_item("Example")])
 
@@ -61,11 +63,18 @@ def test_json_parser_excludes_archived_and_trashed_entries(tmp_path: Path) -> No
     source = tmp_path / "export.json"
     write_json(
         source,
-        [login_item("Active"), login_item("Archived", archived=1), login_item("Trash", trashed=1)],
+        [
+            login_item("Active"),
+            login_item("Archived", archived=1),
+            login_item("Trash", trashed=1),
+        ],
     )
 
     assert [entry.title for entry in cli.parse_enpass_json(source)] == ["Active"]
-    assert len(cli.parse_enpass_json(source, include_archived=True, include_trashed=True)) == 3
+    assert (
+        len(cli.parse_enpass_json(source, include_archived=True, include_trashed=True))
+        == 3
+    )
 
 
 @pytest.mark.parametrize("source", [ENPASS_CSV, ENPASS_JSON])
