@@ -1,74 +1,96 @@
-import os
-import tempfile
 import csv
-import filecmp
-from enpass_escape import cli
+import json
+import stat
+from pathlib import Path
+
 import pytest
 
-# Use absolute path to testdata at project root
-TESTDATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'testdata'))
-ENPASS_CSV = os.path.join(TESTDATA_DIR, 'enpass', 'export.csv')
-ENPASS_JSON = os.path.join(TESTDATA_DIR, 'enpass', 'export.json')
-APPLE_EXPECTED = os.path.join(TESTDATA_DIR, 'apple', 'Passwords.csv')
+from enpass_escape import cli
 
 
-def read_csv_as_list(filepath):
-    with open(filepath, newline='', encoding='utf-8') as f:
-        return list(csv.reader(f))
+TESTDATA_DIR = Path(__file__).parents[2] / "testdata"
+ENPASS_CSV = TESTDATA_DIR / "enpass" / "export.csv"
+ENPASS_JSON = TESTDATA_DIR / "enpass" / "export.json"
 
 
-def test_csv_to_apple_conversion():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_file = os.path.join(tmpdir, 'apple_out.csv')
-        cli.transform_enpass_csv_to_apple(ENPASS_CSV, out_file)
-        expected = read_csv_as_list(APPLE_EXPECTED)
-        actual = read_csv_as_list(out_file)
-        # Check header matches exactly
-        assert actual[0] == expected[0], 'Header mismatch'
-        # Check each row has correct number of columns and Notes/OTPAuth mapping
-        for row in actual[1:]:
-            assert len(row) == len(expected[0]), f"Row has wrong number of columns: {row}"
-            # Notes should be in column 4, OTPAuth in column 5
-            assert 'otpauth://' in row[5] or row[5] == '', f"OTPAuth not in correct column: {row}"
-            # Notes can be empty or any string, but must be in column 4
-            assert isinstance(row[4], str)
+def read_csv(filepath: Path) -> list[list[str]]:
+    with filepath.open(newline="", encoding="utf-8") as source:
+        return list(csv.reader(source))
 
 
-def test_json_to_apple_conversion():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_file = os.path.join(tmpdir, 'apple_out.csv')
-        cli.transform_enpass_to_apple(ENPASS_JSON, out_file)
-        expected = read_csv_as_list(APPLE_EXPECTED)
-        actual = read_csv_as_list(out_file)
-        assert actual[0] == expected[0], 'Header mismatch'
-        for row in actual[1:]:
-            assert len(row) == len(expected[0]), f"Row has wrong number of columns: {row}"
-            assert 'otpauth://' in row[5] or row[5] == '', f"OTPAuth not in correct column: {row}"
-            assert isinstance(row[4], str)
+def write_json(filepath: Path, items: list[dict[str, object]]) -> None:
+    filepath.write_text(json.dumps({"items": items}), encoding="utf-8")
 
 
-def test_cli_main_csv(tmp_path):
-    out_file = tmp_path / 'apple_out.csv'
-    cli.main(str(ENPASS_CSV), str(out_file))
-    expected = read_csv_as_list(APPLE_EXPECTED)
-    actual = read_csv_as_list(out_file)
-    # Check header matches exactly
-    assert actual[0] == expected[0], 'Header mismatch'
-    # Check each row has correct number of columns and Notes/OTPAuth mapping
-    for row in actual[1:]:
-        assert len(row) == len(expected[0]), f"Row has wrong number of columns: {row}"
-        # Notes should be in column 4, OTPAuth in column 5
-        assert 'otpauth://' in row[5] or row[5] == '', f"OTPAuth not in correct column: {row}"
-        assert isinstance(row[4], str)
+def login_item(
+    title: str,
+    *,
+    archived: int = 0,
+    trashed: int = 0,
+) -> dict[str, object]:
+    return {
+        "title": title,
+        "note": "original note",
+        "updated_at": 123,
+        "uuid": title,
+        "archived": archived,
+        "trashed": trashed,
+        "fields": [
+            {"label": "Site", "type": "url", "value": "https://example.com"},
+            {"label": "Login", "type": "username", "value": "user@example.com"},
+            {"label": "Secret", "type": "password", "value": " password with spaces "},
+            {"label": "Any label", "type": "totp", "value": "JBSWY3DPEHPK3PXP"},
+            {"label": "Custom", "type": "text", "value": "kept"},
+        ],
+    }
 
 
-def test_cli_main_json(tmp_path):
-    out_file = tmp_path / 'apple_out.csv'
-    cli.main(str(ENPASS_JSON), str(out_file))
-    expected = read_csv_as_list(APPLE_EXPECTED)
-    actual = read_csv_as_list(out_file)
-    assert actual[0] == expected[0], 'Header mismatch'
-    for row in actual[1:]:
-        assert len(row) == len(expected[0]), f"Row has wrong number of columns: {row}"
-        assert 'otpauth://' in row[5] or row[5] == '', f"OTPAuth not in correct column: {row}"
-        assert isinstance(row[4], str)
+def test_json_parser_uses_types_without_copying_credentials_to_notes(tmp_path: Path) -> None:
+    source = tmp_path / "export.json"
+    write_json(source, [login_item("Example")])
+
+    entry = cli.parse_enpass_json(source)[0]
+
+    assert entry.password == " password with spaces "
+    assert entry.totp == "JBSWY3DPEHPK3PXP"
+    assert entry.updated_at == 123
+    assert entry.extra_notes == ("Custom: kept",)
+
+
+def test_json_parser_excludes_archived_and_trashed_entries(tmp_path: Path) -> None:
+    source = tmp_path / "export.json"
+    write_json(
+        source,
+        [login_item("Active"), login_item("Archived", archived=1), login_item("Trash", trashed=1)],
+    )
+
+    assert [entry.title for entry in cli.parse_enpass_json(source)] == ["Active"]
+    assert len(cli.parse_enpass_json(source, include_archived=True, include_trashed=True)) == 3
+
+
+@pytest.mark.parametrize("source", [ENPASS_CSV, ENPASS_JSON])
+def test_bundled_exports_convert_to_apple(source: Path, tmp_path: Path) -> None:
+    output = tmp_path / "apple.csv"
+
+    cli.transform_enpass_to_apple(source, output)
+
+    rows = read_csv(output)
+    assert rows[0] == cli.APPLE_CSV_HEADER
+    assert len(rows) == 4
+    assert any(row[5].startswith("otpauth://") for row in rows[1:])
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_output_is_not_overwritten_without_force(tmp_path: Path) -> None:
+    output = tmp_path / "apple.csv"
+    output.write_text("keep me", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        cli.write_apple_csv([], output)
+
+    assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_unknown_input_format_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"\.json or \.csv"):
+        cli.parse_enpass(tmp_path / "export.txt")

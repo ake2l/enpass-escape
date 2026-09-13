@@ -1,6 +1,6 @@
 # Enpass-Escape
 
-A lightweight Python CLI to migrate passwords from Enpass to Apple Passwords format. Supports both CSV and JSON exports, preserves TOTP/2FA secrets, and consolidates extra fields into notes.
+A lightweight Python CLI to migrate passwords from Enpass to Apple Passwords. It supports CSV and JSON exports, preserves TOTP secrets, and consolidates extra fields into notes.
 
 ## 🚀 Features
 
@@ -8,6 +8,8 @@ A lightweight Python CLI to migrate passwords from Enpass to Apple Passwords for
 - Preserves TOTP/2FA secrets with proper otpauth URI formatting
 - Maintains titles, URLs, usernames, passwords, and notes
 - Combines any additional fields into organized notes
+- Excludes archived and trashed items unless requested
+- Writes output atomically with owner-only permissions
 - Zero external dependencies except Typer for the CLI interface
 
 ## 📋 Prerequisites
@@ -43,6 +45,12 @@ enpass-escape enpass-export.csv export-apple-passwords.csv
 # JSON-to-CSV
 enpass-escape export.json apple-output.csv
 
+# Include archived items
+enpass-escape export.json apple-output.csv --include-archived
+
+# Replace an existing output file
+enpass-escape export.json apple-output.csv --force
+
 # View help
 enpass-escape --help
 ```
@@ -50,7 +58,7 @@ enpass-escape --help
 The output CSV will have the header:
 
 ```csv
-Title,URL,Username,Password,OTPAuth URL,Notes
+Title,URL,Username,Password,Notes,OTPAuth
 ```
 
 ### Input Formats
@@ -63,14 +71,16 @@ Title,URL,Username,Password,OTPAuth URL,Notes
 Apple Passwords import CSV with the following columns:
 
 ```csv
-Title,URL,Username,Password,Notes,OTPAuth URL
+Title,URL,Username,Password,Notes,OTPAuth
 ```
 
 ## 🔒 Security Considerations
 
 - All processing is local; no network calls
 - No data is stored or cached
+- Output files are unencrypted and readable only by their owner
 - No external dependencies other than Typer
+- Delete the output after importing it successfully
 
 ## 🤝 Contributing
 
