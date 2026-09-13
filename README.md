@@ -1,10 +1,11 @@
 # Enpass-Escape
 
-A lightweight Python CLI to migrate Enpass website passwords to Apple Passwords or Google Password Manager.
+A lightweight Python CLI to migrate Enpass data to Apple Passwords, Bitwarden, or Google Password Manager.
 
 ## 🚀 Features
 
 - Converts Enpass CSV or JSON export to Apple Passwords import CSV
+- Converts Enpass logins and secure notes to Bitwarden CSV
 - Converts website passwords to Google Password Manager CSV
 - Keeps the newest safely identifiable duplicate by default
 - Preserves TOTP/2FA secrets with proper otpauth URI formatting
@@ -60,6 +61,9 @@ enpass-escape export.json apple-output.csv
 # Google Password Manager; website passwords only
 enpass-escape export.json google-output.csv --target google
 
+# Bitwarden personal vault
+enpass-escape export.json bitwarden-output.csv --target bitwarden
+
 # Analyze without creating a plaintext export
 enpass-escape export.json --target google --dry-run
 
@@ -102,6 +106,16 @@ url,username,password,note
 ```
 
 Google exports contain only entries with an HTTP(S) URL and a password. Only the title and item note accompany the login; arbitrary Enpass fields are not copied into Google's note. Files are split automatically at Google's 3,000-entry import limit. TOTP secrets, attachments, and passkeys are not exported.
+
+Bitwarden personal-vault CSV:
+
+```csv
+folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+```
+
+Choose **Bitwarden (csv)** when importing. Logins retain their URL, username, password, TOTP, favorite flag, notes, and custom fields. Other Enpass item types are preserved as secure notes because [Bitwarden CSV supports only logins and secure notes](https://bitwarden.com/help/condition-bitwarden-import/). A single Enpass folder becomes a Bitwarden folder; multiple folders are retained in the item data. Files are split at Bitwarden's 40,000-item limit. Attachments must be uploaded separately.
+
+Bitwarden does not check imports for duplicates. Import each generated file only once.
 
 ### Duplicates
 

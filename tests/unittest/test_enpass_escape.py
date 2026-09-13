@@ -19,8 +19,14 @@ def read_csv(filepath: Path) -> list[list[str]]:
         return list(csv.reader(source))
 
 
-def write_json(filepath: Path, items: list[dict[str, object]]) -> None:
-    filepath.write_text(json.dumps({"items": items}), encoding="utf-8")
+def write_json(
+    filepath: Path,
+    items: list[dict[str, object]],
+    folders: list[dict[str, object]] | None = None,
+) -> None:
+    filepath.write_text(
+        json.dumps({"folders": folders or [], "items": items}), encoding="utf-8"
+    )
 
 
 def login_item(
@@ -32,6 +38,8 @@ def login_item(
     return {
         "title": title,
         "note": "original note",
+        "category": "login",
+        "favorite": 0,
         "updated_at": 123,
         "uuid": title,
         "archived": archived,
@@ -52,7 +60,9 @@ def test_json_parser_uses_types_without_copying_credentials_to_notes(
     source = tmp_path / "export.json"
     item = login_item("Example")
     item["attachments"] = [{"name": "example.txt", "data": "test"}]
-    write_json(source, [item])
+    item["favorite"] = 1
+    item["folders"] = ["folder-id"]
+    write_json(source, [item], [{"uuid": "folder-id", "title": "Personal"}])
 
     entry = cli.parse_enpass_json(source)[0]
 
@@ -60,6 +70,9 @@ def test_json_parser_uses_types_without_copying_credentials_to_notes(
     assert entry.totp == "JBSWY3DPEHPK3PXP"
     assert entry.updated_at == 123
     assert entry.extra_notes == ("Custom: kept",)
+    assert entry.category == "login"
+    assert entry.favorite is True
+    assert entry.folders == ("Personal",)
     assert entry.attachment_count == 1
 
 
@@ -207,6 +220,72 @@ def test_enpass_json_to_google_csv(tmp_path: Path) -> None:
             "user@example.com",
             " password with spaces ",
             "Title: Example\noriginal note",
+        ],
+    ]
+
+
+def test_enpass_json_to_bitwarden_csv(tmp_path: Path) -> None:
+    source = tmp_path / "export.json"
+    output = tmp_path / "bitwarden.csv"
+    item = login_item("Example")
+    item["favorite"] = 1
+    item["folders"] = ["folder-id"]
+    write_json(source, [item], [{"uuid": "folder-id", "title": "Personal"}])
+
+    result = CliRunner().invoke(
+        cli.app,
+        [str(source), str(output), "--target", "bitwarden"],
+    )
+
+    assert result.exit_code == 0
+    assert "Bitwarden items: Logins: 1 | Secure notes: 0" in result.output
+    assert read_csv(output) == [
+        cli.BITWARDEN_CSV_HEADER,
+        [
+            "Personal",
+            "1",
+            "login",
+            "Example",
+            "original note",
+            "Custom: kept",
+            "0",
+            "https://example.com",
+            "user@example.com",
+            " password with spaces ",
+            "JBSWY3DPEHPK3PXP",
+        ],
+    ]
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_bitwarden_csv_preserves_non_login_data_as_secure_note(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "bitwarden.csv"
+    entry = cli.Entry(
+        title="Test card",
+        notes="original note",
+        extra_notes=("Number: 1234", "PIN: 9999"),
+        category="creditcard",
+        folders=("Finance", "Archive"),
+    )
+
+    cli.write_bitwarden_csv([entry], output)
+
+    assert read_csv(output) == [
+        cli.BITWARDEN_CSV_HEADER,
+        [
+            "",
+            "",
+            "note",
+            "Test card",
+            "original note\nNumber: 1234\nPIN: 9999\nEnpass folders: Finance, Archive",
+            "",
+            "0",
+            "",
+            "",
+            "",
+            "",
         ],
     ]
 
