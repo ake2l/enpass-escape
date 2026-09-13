@@ -91,7 +91,7 @@ Google Password Manager CSV:
 url,username,password,note
 ```
 
-Google exports contain only entries with an HTTP(S) URL and a password. Files are split automatically at Google's 3,000-entry import limit. TOTP secrets and passkeys are not exported to Google.
+Google exports contain only entries with an HTTP(S) URL and a password. Only the title and item note accompany the login; arbitrary Enpass fields are not copied into Google's note. Files are split automatically at Google's 3,000-entry import limit. TOTP secrets, attachments, and passkeys are not exported.
 
 ### Duplicates
 

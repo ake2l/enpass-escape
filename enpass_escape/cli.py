@@ -63,6 +63,7 @@ class Entry:
     notes: str = ""
     totp: str = ""
     extra_notes: tuple[str, ...] = ()
+    attachment_count: int = 0
     updated_at: int | None = None
     uuid: str = ""
 
@@ -127,6 +128,7 @@ def _entry_from_fields(
     title: str,
     notes: str,
     fields: Iterable[Mapping[str, object]],
+    attachment_count: int = 0,
     updated_at: int | None = None,
     uuid: str = "",
 ) -> Entry:
@@ -157,6 +159,7 @@ def _entry_from_fields(
         notes=notes,
         totp=values.get("TOTP", ""),
         extra_notes=tuple(extra_notes),
+        attachment_count=attachment_count,
         updated_at=updated_at,
         uuid=uuid,
     )
@@ -187,12 +190,16 @@ def parse_enpass_json(
             isinstance(field, dict) for field in fields
         ):
             raise ValueError("Invalid fields in Enpass JSON export")
+        attachments = item.get("attachments", [])
+        if not isinstance(attachments, list):
+            raise ValueError("Invalid attachments in Enpass JSON export")
         timestamp = item.get("updated_at")
         entries.append(
             _entry_from_fields(
                 title=str(item.get("title", "")),
                 notes=str(item.get("note", "")),
                 fields=fields,
+                attachment_count=len(attachments),
                 updated_at=timestamp
                 if isinstance(timestamp, int) and not isinstance(timestamp, bool)
                 else None,
@@ -302,6 +309,7 @@ def _content_key(entry: Entry) -> tuple[object, ...]:
         entry.notes,
         entry.totp,
         entry.extra_notes,
+        entry.attachment_count,
     )
 
 
@@ -459,7 +467,7 @@ def google_website_entries(entries: Iterable[Entry]) -> tuple[list[Entry], int]:
 def _google_note(entry: Entry) -> str:
     return "\n".join(
         part
-        for part in (f"Title: {entry.title}" if entry.title else "", _notes(entry))
+        for part in (f"Title: {entry.title}" if entry.title else "", entry.notes)
         if part
     )
 
@@ -588,6 +596,7 @@ def main(
         export_entries = list(deduplicated.entries)
         skipped = 0
         skipped_totp = 0
+        skipped_attachments = sum(entry.attachment_count for entry in entries)
         if target == Target.GOOGLE:
             skipped_totp = sum(bool(entry.totp) for entry in export_entries)
             export_entries, skipped = google_website_entries(export_entries)
@@ -596,7 +605,8 @@ def main(
             f"Read {len(entries)}; export {len(export_entries)}; "
             f"duplicates removed {deduplicated.removed}; "
             f"conflicts kept {deduplicated.conflicts}; skipped {skipped}; "
-            f"TOTP not migrated {skipped_totp}."
+            f"TOTP not migrated {skipped_totp}; "
+            f"attachments not migrated {skipped_attachments}."
         )
         if dry_run:
             return
