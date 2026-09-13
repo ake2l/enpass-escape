@@ -29,9 +29,19 @@ pip install enpass-escape
 Or install development version:
 
 ```bash
-git clone https://github.com/ake2l/enpass-apple-migrator.git
-cd enpass-apple-migrator
-pip install -e .
+git clone https://github.com/ake2l/enpass-escape.git
+cd enpass-escape
+python -m venv .venv
+source .venv/bin/activate
+make install
+make check
+```
+
+Run `make help` to list the local development commands. For example:
+
+```bash
+make dry-run INPUT=/path/to/export.json TARGET=google
+make export INPUT=/path/to/export.json OUTPUT=google.csv TARGET=google
 ```
 
 ## 💻 Usage

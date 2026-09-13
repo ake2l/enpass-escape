@@ -31,6 +31,14 @@ dependencies = [
     "typer[all]"
 ]
 
+[project.optional-dependencies]
+dev = [
+    "build",
+    "mypy",
+    "pytest",
+    "ruff",
+]
+
 [project.scripts]
 enpass-escape = "enpass_escape.cli:app"
 
@@ -48,3 +56,6 @@ include = ["enpass_escape"]
 [tool.setuptools_scm]
 version_scheme = "post-release"
 local_scheme = "no-local-version"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
