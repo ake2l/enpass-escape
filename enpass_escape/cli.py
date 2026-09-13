@@ -8,6 +8,7 @@ import re
 import tempfile
 import urllib.parse
 import warnings
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -444,21 +445,22 @@ def write_apple_csv(
     )
 
 
-def google_website_entries(entries: Iterable[Entry]) -> tuple[list[Entry], int]:
+def google_website_entries(
+    entries: Iterable[Entry],
+) -> tuple[list[Entry], Counter[str]]:
     """Keep credentials that Google can import as website passwords."""
     accepted: list[Entry] = []
-    skipped = 0
+    skipped: Counter[str] = Counter()
     for entry in entries:
+        if not entry.password:
+            skipped["missing password"] += 1
+            continue
         try:
             url = urllib.parse.urlsplit(entry.url)
         except ValueError:
             url = urllib.parse.SplitResult("", "", "", "", "")
-        if (
-            url.scheme.casefold() not in {"http", "https"}
-            or not url.hostname
-            or not entry.password
-        ):
-            skipped += 1
+        if url.scheme.casefold() not in {"http", "https"} or not url.hostname:
+            skipped["invalid website URL"] += 1
             continue
         accepted.append(entry)
     return accepted, skipped
@@ -594,21 +596,28 @@ def main(
         )
         deduplicated = deduplicate(entries, duplicates)
         export_entries = list(deduplicated.entries)
-        skipped = 0
+        skip_reasons: Counter[str] = Counter()
         skipped_totp = 0
         skipped_attachments = sum(entry.attachment_count for entry in entries)
         if target == Target.GOOGLE:
             skipped_totp = sum(bool(entry.totp) for entry in export_entries)
-            export_entries, skipped = google_website_entries(export_entries)
+            export_entries, skip_reasons = google_website_entries(export_entries)
 
         typer.echo(
-            f"Read {len(entries)}; export {len(export_entries)}; "
-            f"duplicates removed {deduplicated.removed}; "
-            f"conflicts kept {deduplicated.conflicts}; skipped {skipped}; "
-            f"TOTP not migrated {skipped_totp}; "
-            f"attachments not migrated {skipped_attachments}."
+            f"Read: {len(entries)} | Export: {len(export_entries)} | "
+            f"Duplicates removed: {deduplicated.removed} | "
+            f"Conflicts kept: {deduplicated.conflicts}"
+        )
+        skipped = sum(skip_reasons.values())
+        details = ", ".join(
+            f"{reason}: {count}" for reason, count in skip_reasons.items()
+        )
+        typer.echo(f"Skipped: {skipped}" + (f" ({details})" if details else ""))
+        typer.echo(
+            f"Not migrated: TOTP: {skipped_totp} | Attachments: {skipped_attachments}"
         )
         if dry_run:
+            typer.echo("Dry run: no files created.")
             return
 
         destination = output_file or f"export-{target.value}-passwords.csv"

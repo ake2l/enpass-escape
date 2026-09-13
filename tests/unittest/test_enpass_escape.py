@@ -178,7 +178,10 @@ def test_google_export_contains_only_website_passwords(tmp_path: Path) -> None:
     paths = cli.write_google_csv(entries, output)
 
     assert paths == (output,)
-    assert skipped == 2
+    assert skipped == {
+        "invalid website URL": 1,
+        "missing password": 1,
+    }
     assert read_csv(output) == [
         cli.GOOGLE_CSV_HEADER,
         ["https://example.com", "user", "secret", "Title: Example\nnote"],
@@ -196,7 +199,7 @@ def test_enpass_json_to_google_csv(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "TOTP not migrated 1" in result.output
+    assert "Not migrated: TOTP: 1" in result.output
     assert read_csv(output) == [
         cli.GOOGLE_CSV_HEADER,
         [
@@ -228,6 +231,6 @@ def test_google_dry_run_writes_nothing() -> None:
     )
 
     assert result.exit_code == 0
-    assert "TOTP not migrated 1" in result.output
-    assert "attachments not migrated 0" in result.output
+    assert "Not migrated: TOTP: 1 | Attachments: 0" in result.output
+    assert "Dry run: no files created." in result.output
     assert "Created:" not in result.output
